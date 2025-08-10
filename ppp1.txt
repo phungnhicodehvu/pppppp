@@ -1,0 +1,535 @@
+import os, sys, subprocess
+
+# ========== AUTO INSTALL PACKAGES ==========
+packages = [
+    "flask", "nest_asyncio", "aiohttp", "pandas", "ta",
+    "mplfinance", "matplotlib", "python-telegram-bot==20.3"
+]
+for pkg in packages:
+    try:
+        __import__(pkg if pkg != "ta" else "ta")
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+# ========== IMPORTS ==========
+from flask import Flask
+from threading import Thread
+import logging
+import nest_asyncio
+import asyncio
+import aiohttp
+import pandas as pd
+import ta
+import mplfinance as mpf
+from datetime import datetime, timedelta
+from io import BytesIO
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+)
+
+# ========== CONFIG ==========
+BOT_TOKEN = "8177821138:AAEQkMD7HKpueI2Ep2V-DCuugCVqvuvv74Q"  # giữ nguyên từ code gốc
+TP_PERCENT = 10.0
+SL_PERCENT = 1.5
+MAX_SYMBOLS = 50
+CACHE_DURATION = timedelta(minutes=3)
+CACHE_CLEAN_DURATION = timedelta(hours=24)
+TIMEFRAMES = ["3m", "5m", "15m", "30m", "1h", "4h"]
+OHLCV_LIMIT = 200
+
+# chỉ cho phép /signal chạy trong group này
+ALLOWED_GROUP_ID = -1002471816906
+
+logging.basicConfig(level=logging.INFO)
+nest_asyncio.apply()
+
+# caches & state
+ohlcv_cache = {}
+user_state = {}
+last_signal_time = {}
+
+# ========== FLASK KEEP-ALIVE ==========
+app = Flask('')
+@app.route('/')
+def home():
+    return "✅ Bot AI Crypto đang hoạt động 24/7."
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    Thread(target=run_flask, daemon=True).start()
+
+# ========== CACHE HELPERS ==========
+def cache_get(key):
+    now = datetime.utcnow()
+    v = ohlcv_cache.get(key)
+    if not v:
+        return None
+    ts, data = v
+    if now - ts < CACHE_DURATION:
+        return data
+    try:
+        del ohlcv_cache[key]
+    except KeyError:
+        pass
+    return None
+
+def cache_set(key, data):
+    ohlcv_cache[key] = (datetime.utcnow(), data)
+    now = datetime.utcnow()
+    remove = [k for k, (t, _) in ohlcv_cache.items() if now - t > CACHE_CLEAN_DURATION]
+    for k in remove:
+        del ohlcv_cache[k]
+
+# ========== API FETCHERS ==========
+async def get_okx_swap_symbols(session):
+    url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+    try:
+        async with session.get(url, timeout=15) as resp:
+            j = await resp.json()
+        data = j.get("data", []) or []
+        swaps = [x for x in data if x.get("instId", "").endswith("USDT-SWAP")]
+        swaps.sort(key=lambda x: float(x.get("volCcy24h") or 0), reverse=True)
+        return [x["instId"] for x in swaps[:MAX_SYMBOLS]]
+    except Exception as e:
+        logging.error("get_okx_swap_symbols error: %s", e)
+        return []
+
+async def fetch_ohlcv_okx(session, symbol, tf, limit):
+    try:
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={tf}&limit={limit}"
+        async with session.get(url, timeout=15) as resp:
+            j = await resp.json()
+        data = j.get("data", []) or []
+        # OKX returns arrays [ts, open, high, low, close, volume, ...]
+        return [{"timestamp": int(d[0]), "open": float(d[1]), "high": float(d[2]),
+                 "low": float(d[3]), "close": float(d[4]), "volume": float(d[5])}
+                for d in reversed(data)]
+    except Exception as e:
+        logging.debug("fetch_ohlcv_okx error %s %s", symbol, e)
+        return []
+
+async def fetch_ohlcv_multi(symbols, tf, limit=OHLCV_LIMIT):
+    results = []
+    to_fetch = []
+    keys = []
+    for s in symbols:
+        key = (s, tf)
+        keys.append(key)
+        cached = cache_get(key)
+        if cached is not None:
+            results.append(cached)
+        else:
+            results.append(None)
+            to_fetch.append(s)
+
+    if to_fetch:
+        async with aiohttp.ClientSession() as session:
+            tasks = [fetch_ohlcv_okx(session, s, tf, limit) for s in to_fetch]
+            fetched = await asyncio.gather(*tasks)
+        fi = 0
+        for i, val in enumerate(results):
+            if val is None:
+                data = fetched[fi]
+                fi += 1
+                if data:
+                    cache_set(keys[i], data)
+                    results[i] = data
+                else:
+                    results[i] = []
+    return results
+
+# ========== ANALYSIS ==========
+def analyze_technical(df):
+    df = df.copy()
+    for col in ["close", "open", "high", "low", "volume"]:
+        df[col] = df[col].astype(float)
+
+    # Core indicators (from ta)
+    df["EMA12"] = ta.trend.ema_indicator(df["close"], window=12)
+    df["EMA26"] = ta.trend.ema_indicator(df["close"], window=26)
+    df["EMA50"] = ta.trend.ema_indicator(df["close"], window=50)
+    df["EMA100"] = ta.trend.ema_indicator(df["close"], window=100)
+    df["EMA200"] = ta.trend.ema_indicator(df["close"], window=200)
+    df["SMA20"] = ta.trend.sma_indicator(df["close"], window=20)
+    df["SMA50"] = ta.trend.sma_indicator(df["close"], window=50)
+
+    df["RSI"] = ta.momentum.rsi(df["close"], window=14)
+    macd = ta.trend.MACD(df["close"])
+    df["MACD"] = macd.macd()
+    df["MACD_signal"] = macd.macd_signal()
+    df["MACDh"] = macd.macd_diff()
+
+    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+    df["BBU"] = bb.bollinger_hband()
+    df["BBL"] = bb.bollinger_lband()
+    df["BBM"] = bb.bollinger_mavg()
+    df["BB_width"] = (df["BBU"] - df["BBL"]) / df["BBM"]
+
+    df["ATR"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+    df["ADX"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+    df["CCI"] = ta.trend.cci(df["high"], df["low"], df["close"], window=20)
+    df["ROC"] = ta.momentum.roc(df["close"], window=12)
+    df["WILLIAMS"] = ta.momentum.williams_r(df["high"], df["low"], df["close"], lbp=14)
+    df["OBV"] = ta.volume.on_balance_volume(df["close"], df["volume"])
+
+    return df
+
+def safe_get(latest, key, default=0.0):
+    v = latest.get(key, default)
+    try:
+        if pd.isna(v):
+            return default
+    except Exception:
+        pass
+    return v
+
+def calculate_ai_score(latest):
+    # reuse previous scoring but can be augmented
+    score = 0
+    if safe_get(latest, "EMA12") > safe_get(latest, "EMA26"): score += 15
+    if safe_get(latest, "EMA50") > safe_get(latest, "EMA100"): score += 15
+    if safe_get(latest, "EMA100") > safe_get(latest, "EMA200"): score += 15
+    r = safe_get(latest, "RSI", 50)
+    if r < 30 or r > 70: score += 20
+    else: score += 10
+    if safe_get(latest, "MACDh") > 0: score += 20
+    width = safe_get(latest, "BBU") - safe_get(latest, "BBL")
+    score += 10 if width > safe_get(latest, "close") * 0.05 else 5
+    return min(score + 5, 100)
+
+def decide_direction(latest):
+    # priority: RSI, then EMA cross
+    r = safe_get(latest, "RSI", 50)
+    if r > 70:
+        return "SHORT", "RSI>70"
+    if r < 30:
+        return "LONG", "RSI<30"
+    if safe_get(latest, "EMA12") > safe_get(latest, "EMA26"):
+        return "LONG", "EMA12>EMA26"
+    return "SHORT", "EMA12<EMA26"
+
+# ========== CHART ==========
+def make_candlestick_chart(df_records, symbol, timeframe, entry, tp, sl):
+    df_plot = pd.DataFrame({
+        "Open": [x["open"] for x in df_records],
+        "High": [x["high"] for x in df_records],
+        "Low": [x["low"] for x in df_records],
+        "Close": [x["close"] for x in df_records],
+        "Volume": [x["volume"] for x in df_records],
+    }, index=pd.to_datetime([x["timestamp"] for x in df_records], unit='ms'))
+
+    show_n = min(len(df_plot), 120)
+    df_plot = df_plot.iloc[-show_n:]
+
+    style = mpf.make_mpf_style(base_mpf_style='classic', rc={'figure.facecolor':'white', 'axes.facecolor':'white'})
+    hlines = dict(hlines=[entry, tp, sl], colors=['#808080','#008000','#FF0000'], linewidths=[0.8,1.0,1.0], linestyle='--')
+    buf = BytesIO()
+    mpf.plot(df_plot, type='candle', style=style, volume=True, title=f"{symbol}  {timeframe}",
+             hlines=hlines, savefig=dict(fname=buf, dpi=150, bbox_inches='tight'))
+    buf.seek(0)
+    return buf
+
+# ========== MESSAGE ==========
+def build_signal_text(symbol, latest, score, direction, reason, exchange_display, timeframe, entry, tp, sl, top10_list, resistance, support, scan_time_vn):
+    try:
+        entry_f = float(entry)
+        tp_f = float(tp)
+        sl_f = float(sl)
+        if direction == "LONG":
+            tp_pct = round((tp_f - entry_f) / entry_f * 100, 2)
+            sl_pct = round((entry_f - sl_f) / entry_f * 100, 2)
+        else:
+            tp_pct = round((entry_f - tp_f) / entry_f * 100, 2)
+            sl_pct = round((sl_f - entry_f) / entry_f * 100, 2)
+    except Exception:
+        tp_pct = sl_pct = 0.0
+
+    rsi_state = "Quá mua" if safe_get(latest, "RSI") > 70 else "Quá bán" if safe_get(latest, "RSI") < 30 else "Trung tính"
+    boll_state = "mở rộng" if (safe_get(latest, "BBU") - safe_get(latest, "BBL")) > safe_get(latest, "close") * 0.05 else "thu hẹp"
+
+    top10_block = "\n".join(top10_list) if top10_list else "Không có dữ liệu chỉ báo."
+
+    txt = (
+        f"⏰ Thời gian quét: {scan_time_vn} (UTC+7)\n\n"
+        f"📊 TÍN HIỆU AI QUÉT TỰ ĐỘNG - PHÂN TÍCH 50+ CHỈ BÁO KỸ THUẬT\n"
+        f"DƯỚI ĐÂY LÀ 10 CHỈ BÁO MẠNH NHẤT\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔹 Cặp: {symbol}\n"
+        f"🔹 Hướng: {direction}\n"
+        f"🔹 AI Score: {score:.1f}/100\n\n"
+        f"💰 Entry: {entry_f:.6f}\n"
+        f"🎯 TP: {tp_f:.6f} ({tp_pct}%)\n"
+        f"🛡 SL: {sl_f:.6f} ({sl_pct}%)\n\n"
+        f"🤖 RSI: {safe_get(latest,'RSI'):.2f} ➜ {rsi_state}\n"
+        f"📈 Bollinger: {boll_state}\n"
+        f"📍 Kháng cự: {resistance}\n"
+        f"📍 Hỗ trợ: {support}\n\n"
+        f"📊 10 CHỈ BÁO MẠNH NHẤT\n"
+        f"{top10_block}\n\n"
+        f"📌 AI phân tích & gợi ý: Mở lệnh {direction} theo khung {timeframe} — ưu tiên đánh giá RSI, sau đó xác nhận bằng EMA/MACD và Bollinger.\n\n"
+        f"⚠️ CẢNH BÁO: Đây là tín hiệu AI để tham khảo. Vui lòng phân tích kỹ trước khi vào lệnh và tự chịu trách nhiệm với quyết định của mình. Chúc bạn thành công!"
+    )
+    return txt
+
+# ========== TELEGRAM HANDLERS ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🚀🔥 TRẢI NGHIỆM NGAY BOT TRADE COIN SMART 🔥🚀", url="https://t.me/mtw_tradesmartbot?start=6961161271")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "Chào mừng bạn đến với bot AI- SIGNALS FUTURE\n\n"
+        "📈 Bot báo tín hiệu crypto future theo thời gian thực.\n"
+        "🤖 Tích hợp AI-TRADE COIN SMART\n"
+        "📊 Hỗ trợ OKX,BINGX giao dịch Future an toàn, nhanh và chính xác.",
+        reply_markup=reply_markup
+    )
+
+# VIP command
+async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vip_msg = (
+        "📢 Đăng ký VIP\n\n"
+        "Bạn hãy đăng ký sàn BingX hoặc OKX dưới hệ thống của team:\n\n"
+        "🔹 OKX: https://www.okx.com/join/NHA26 (Mã giới thiệu: NHA26)\n"
+        "🔹 BingX: https://bingx.com/partner/PHNTRADING (Mã giới thiệu: PHNTRDING)\n\n"
+        "Sau khi đăng ký và nạp vốn sàn, vui lòng gửi ảnh đã nạp vốn và UID sàn để được thêm vào nhóm VIP.\n\n"
+        "📩 Liên hệ Admin: @soros_mtw"
+    )
+    await update.message.reply_text(vip_msg)
+
+# signal command entry point
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # If not in allowed group -> ask to join group
+    if chat_id != ALLOWED_GROUP_ID:
+        await update.message.reply_text("✈️ Hãy join nhóm https://t.me/botokxvietnam26 để sử dụng tính năng này")
+        return
+
+    user_id = update.effective_user.id
+    now = datetime.utcnow()
+    if user_id in last_signal_time and (now - last_signal_time[user_id]).total_seconds() < 3:
+        await update.message.reply_text("⏱ Vui lòng đợi vài giây trước khi sử dụng lại.")
+        return
+    last_signal_time[user_id] = now
+
+    kb = [[InlineKeyboardButton("OKX", callback_data="exchange_okx"),
+           InlineKeyboardButton("BingX", callback_data="exchange_bingx")]]
+    await update.message.reply_text("🤖 Hệ thống AI quét tín hiệu tự động.\nChọn sàn:", reply_markup=InlineKeyboardMarkup(kb))
+
+# callback when exchange chosen
+async def handle_exchange_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    exchange = query.data.split("_")[1]
+    user_state[user_id] = {"exchange": exchange}
+    buttons = [InlineKeyboardButton(tf, callback_data=f"time_{tf}") for tf in TIMEFRAMES]
+    keyboard = [buttons[0:3], buttons[3:6]]
+    await query.edit_message_text("⏳ Chọn khung thời gian:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# callback when timeframe chosen -> do full scan and send results
+async def handle_time_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    tf = query.data.split("_")[1]
+    state = user_state.get(user_id)
+    if not state or "exchange" not in state:
+        await query.edit_message_text("⚠️ Vui lòng bắt đầu lại bằng lệnh /signal.")
+        return
+    exchange = state["exchange"]
+    exchange_display = "BingX" if exchange == "bingx" else "OKX"
+
+    await query.edit_message_text(f"🔍 Đang quét tín hiệu AI sàn {exchange_display} - Khung {tf}\n💡 Vui lòng chờ...")
+
+    async with aiohttp.ClientSession() as session:
+        symbols = await get_okx_swap_symbols(session)
+        if not symbols:
+            await query.edit_message_text("❌ Không lấy được danh sách cặp. Thử lại sau.")
+            return
+        ohlcv_list = await fetch_ohlcv_multi(symbols, tf, OHLCV_LIMIT)
+
+    candidates = []
+    for sym, raw in zip(symbols, ohlcv_list):
+        if not raw or len(raw) < 100:
+            continue
+        try:
+            df = pd.DataFrame(raw)
+            df = analyze_technical(df)
+            latest = df.iloc[-1].to_dict()
+            score = calculate_ai_score(latest)
+            direction, reason = decide_direction(latest)
+            candidates.append((score, sym, df, latest, direction, reason))
+        except Exception as e:
+            logging.debug("analyze error %s: %s", sym, e)
+            continue
+
+    if not candidates:
+        await query.edit_message_text("❌ Không tìm thấy tín hiệu rõ ràng.")
+        return
+
+    top = sorted(candidates, key=lambda x: x[0], reverse=True)[:2]
+    await query.edit_message_text(f"✅ Quét xong. Tìm thấy {len(top)} tín hiệu mạnh nhất ({exchange_display} - {tf}).")
+
+    for score, sym, df, latest, direction, reason in top:
+        entry = float(safe_get(latest, "close", 0.0))
+        if direction == "LONG":
+            tp = entry * (1 + TP_PERCENT / 100.0)
+            sl = entry * (1 - SL_PERCENT / 100.0)
+        else:
+            tp = entry * (1 - TP_PERCENT / 100.0)
+            sl = entry * (1 + SL_PERCENT / 100.0)
+
+        # ------------------ build top 10 indicators dynamically (from real data) ------------------
+        try:
+            latest_row = df.iloc[-1]
+            top_indicators = []
+
+            # Priority 1: RSI (strong weight)
+            rsi_val = safe_get(latest_row, "RSI")
+            if pd.notna(rsi_val):
+                if rsi_val > 70:
+                    top_indicators.append((f"RSI {rsi_val:.2f} ➜ Quá mua", 1.0))
+                elif rsi_val < 30:
+                    top_indicators.append((f"RSI {rsi_val:.2f} ➜ Quá bán", 1.0))
+                else:
+                    top_indicators.append((f"RSI {rsi_val:.2f} ➜ Trung tính", 0.8))
+
+            # EMA crosses
+            e12 = safe_get(latest_row, "EMA12")
+            e26 = safe_get(latest_row, "EMA26")
+            if e12 and e26:
+                if e12 > e26:
+                    top_indicators.append(("EMA12 > EMA26", 0.9))
+                else:
+                    top_indicators.append(("EMA12 < EMA26", 0.35))
+
+            # EMA medium/long
+            if safe_get(latest_row, "EMA50") > safe_get(latest_row, "EMA100"):
+                top_indicators.append(("EMA50 > EMA100", 0.8))
+            else:
+                top_indicators.append(("EMA50 < EMA100", 0.3))
+
+            if safe_get(latest_row, "EMA100") > safe_get(latest_row, "EMA200"):
+                top_indicators.append(("EMA100 > EMA200", 0.8))
+            else:
+                top_indicators.append(("EMA100 < EMA200", 0.3))
+
+            # MACD
+            if safe_get(latest_row, "MACDh") > 0:
+                top_indicators.append(("MACD Histogram dương (Đà tăng)", 0.85))
+            else:
+                top_indicators.append(("MACD Histogram âm (Đà giảm)", 0.35))
+
+            # Bollinger width
+            width_now = safe_get(latest_row, "BBU") - safe_get(latest_row, "BBL")
+            width_mean = (df["BBU"] - df["BBL"]).mean() if "BBU" in df.columns and "BBL" in df.columns else 0
+            if width_mean and width_now > width_mean:
+                top_indicators.append(("Bollinger Bands mở rộng (Biến động cao)", 0.7))
+            else:
+                top_indicators.append(("Bollinger Bands thu hẹp (Biến động thấp)", 0.3))
+
+            # Price vs EMA200
+            if safe_get(latest_row, "close") > safe_get(latest_row, "EMA200"):
+                top_indicators.append(("Giá nằm trên EMA200 (Xu hướng tăng bền vững)", 0.75))
+            else:
+                top_indicators.append(("Giá nằm dưới EMA200 (Yếu hơn)", 0.3))
+
+            # Volume
+            try:
+                vol_mean20 = df["volume"].rolling(20).mean().iloc[-1]
+                if latest_row["volume"] > vol_mean20:
+                    top_indicators.append(("Khối lượng giao dịch tăng so với trung bình", 0.6))
+                else:
+                    top_indicators.append(("Khối lượng giao dịch yếu hơn trung bình", 0.3))
+            except Exception:
+                pass
+
+            # ADX strength
+            if safe_get(latest_row, "ADX") > 25:
+                top_indicators.append((f"ADX {safe_get(latest_row,'ADX'):.2f} ➜ Trend mạnh", 0.65))
+
+            # ATR (volatility)
+            if safe_get(latest_row, "ATR") and safe_get(latest_row, "ATR") > df["ATR"].mean():
+                top_indicators.append(("ATR cao (Biến động tăng)", 0.55))
+
+            # CCI, Williams, ROC checks
+            if safe_get(latest_row, "CCI") > 100:
+                top_indicators.append((f"CCI {safe_get(latest_row,'CCI'):.2f} ➜ Tín hiệu mua", 0.5))
+            if safe_get(latest_row, "WILLIAMS") < -80:
+                top_indicators.append((f"W%R {safe_get(latest_row,'WILLIAMS'):.2f} ➜ Quá bán", 0.6))
+            if safe_get(latest_row, "ROC") > 0:
+                top_indicators.append((f"ROC {safe_get(latest_row,'ROC'):.2f} ➜ Đà tăng ngắn hạn", 0.5))
+
+            # Price vs upper band
+            if safe_get(latest_row, "close") >= safe_get(latest_row, "BBU"):
+                top_indicators.append(("Bollinger Upper band mở rộng (Áp lực mua)", 0.6))
+
+            # Consolidate unique and sort by score, ensuring RSI entries remain top priority if present
+            uniq = []
+            seen = set()
+            for txt, s in top_indicators:
+                if txt not in seen:
+                    uniq.append((txt, s))
+                    seen.add(txt)
+
+            # Force RSI to top if present
+            uniq_sorted = sorted(uniq, key=lambda x: (0 if x[0].startswith("RSI") else 1, -x[1]))
+            # Then sort by score within groups (RSI first)
+            uniq_sorted = sorted(uniq_sorted, key=lambda x: (-x[1], 0 if x[0].startswith("RSI") else 1))
+
+            # Build top10_list strings
+            top10_list = [f"{i+1}️⃣ {uniq_sorted[i][0]}" for i in range(min(10, len(uniq_sorted)))]
+            i = len(top10_list)
+            while i < 10:
+                top10_list.append(f"{i+1}️⃣ -")
+                i += 1
+        except Exception as e:
+            logging.debug("top10 build error: %s", e)
+            top10_list = [f"{i+1}️⃣ -" for i in range(10)]
+
+        # ------------------ resistance & support ------------------
+        try:
+            high_tail = df["high"].tail(20)
+            low_tail = df["low"].tail(20)
+            resistance = f"{round(high_tail.max(), 2)} – {round(high_tail.nlargest(2).iloc[-1], 2)}"
+            support = f"{round(low_tail.nsmallest(2).iloc[-1], 2)} – {round(low_tail.min(), 2)}"
+        except Exception:
+            resistance = "-"
+            support = "-"
+
+        # ------------------ time VN ------------------
+        now_vn = (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M")
+
+        # ------------------ build final caption/message & send ------------------
+        try:
+            caption = build_signal_text(sym, latest, score, direction, reason, exchange_display, tf, entry, tp, sl, top10_list, resistance, support, now_vn)
+            chart_buf = make_candlestick_chart(df.to_dict('records'), sym, tf, entry, tp, sl)
+            chart_buf.seek(0)
+            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_buf, caption=caption)
+        except Exception as e:
+            logging.debug("send photo/caption error: %s", e)
+            # fallback to text only
+            try:
+                await query.message.reply_text(caption)
+            except Exception:
+                logging.debug("fallback reply failed")
+
+# ========== RUN BOT ==========
+async def run_bot():
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("vip", vip_command))
+    tg_app.add_handler(CommandHandler("signal", signal))
+    tg_app.add_handler(CallbackQueryHandler(handle_exchange_selection, pattern="^exchange_"))
+    tg_app.add_handler(CallbackQueryHandler(handle_time_selection, pattern="^time_"))
+    await tg_app.run_polling()
+
+if __name__ == "__main__":
+    keep_alive()
+    asyncio.run(run_bot())
